@@ -1,0 +1,16 @@
+[phases.setup]
+nixPkgs = ["gcc", "musl-dev", "gcompat"]
+
+[phases.install]
+cmds = [
+  "cd src && go mod download"
+]
+
+[phases.build]
+cmds = [
+  "cd src && go build -a -ldflags='-w -s' -o /app/whatsapp"
+]
+
+[start]
+cmd = "/app/whatsapp rest"
+

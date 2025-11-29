@@ -8,3 +8,11 @@
 .env.test
 .env.production
 docker
+*.md
+LICENCE.txt
+gallery
+docs
+.cursor
+.claude
+.github
+docker-compose.yml
