@@ -1,354 +1,363 @@
-# Plano de Implementação: Multi-Sessão Nativa + Dashboard
+# Plano de Implementação: Multi-Sessão Nativa no GoWA
 
 ## 📋 Objetivo
 
-Implementar suporte nativo a múltiplas sessões WhatsApp no GoWA, mantendo o baixo consumo de memória (~15MB por sessão) e adicionando dashboard de gerenciamento similar ao WAHA.
-
----
+Transformar o GoWA em uma solução multi-sessão nativa (similar ao WAHA) mantendo o baixo consumo de memória (15MB por sessão) e adicionando dashboard de gerenciamento.
 
 ## 🎯 Requisitos
 
-### Funcionalidades Principais
-1. ✅ **Múltiplas sessões simultâneas** - Similar ao WAHA com `session_id`
-2. ✅ **Dashboard de gerenciamento** - Interface web para gerenciar sessões
-3. ✅ **Baixo consumo de memória** - Manter ~15MB por sessão
-4. ✅ **API compatível** - Manter compatibilidade com API atual
-5. ✅ **Isolamento de dados** - Cada sessão com seu próprio storage
+1. **Múltiplas sessões simultâneas** - Suporte nativo a N sessões WhatsApp
+2. **Dashboard de gerenciamento** - Interface web para gerenciar sessões
+3. **Baixo consumo de memória** - Manter ~15MB por sessão
+4. **API com session_id** - Rotas no formato `/api/:session/...`
+5. **Isolamento de dados** - Cada sessão com seu próprio armazenamento
 
-### Métricas de Sucesso
-- Memória: ≤ 20MB por sessão ativa
-- Tempo de inicialização: < 2s por sessão
-- API response time: < 100ms (p95)
-- Suporte: Mínimo 50 sessões simultâneas
+---
+
+## 📊 Análise da Arquitetura Atual
+
+### GoWA (Atual) - Single Session
+
+```
+┌─────────────────────────────────────┐
+│         Aplicação GoWA              │
+│                                     │
+│  ┌──────────────────────────────┐  │
+│  │  Global Client (cli)         │  │
+│  │  - Único cliente WhatsApp    │  │
+│  │  - GetFirstDevice()          │  │
+│  └──────────────────────────────┘  │
+│                                     │
+│  ┌──────────────────────────────┐  │
+│  │  Database Container          │  │
+│  │  - SQLite/PostgreSQL         │  │
+│  │  - Armazena todos devices    │  │
+│  └──────────────────────────────┘  │
+│                                     │
+│  ┌──────────────────────────────┐  │
+│  │  Chat Storage                │  │
+│  │  - SQLite separado           │  │
+│  │  - Histórico de mensagens    │  │
+│  └──────────────────────────────┘  │
+└─────────────────────────────────────┘
+```
+
+**Problemas:**
+- Cliente global único (`var cli *whatsmeow.Client`)
+- Sem isolamento entre sessões
+- Sem identificação de sessão nas APIs
+- Não escala para múltiplas sessões
+
+### WAHA (Referência) - Multi Session
+
+```
+┌─────────────────────────────────────┐
+│         Aplicação WAHA              │
+│                                     │
+│  ┌──────────────────────────────┐  │
+│  │  Session Manager             │  │
+│  │  - Map[sessionID]*Client     │  │
+│  │  - Criação/Destruição        │  │
+│  └──────────────────────────────┘  │
+│                                     │
+│  ┌──────┐ ┌──────┐ ┌──────┐       │
+│  │ Sess1│ │ Sess2│ │ Sess3│       │
+│  │ DB1  │ │ DB2  │ │ DB3  │       │
+│  └──────┘ └──────┘ └──────┘       │
+│                                     │
+│  ┌──────────────────────────────┐  │
+│  │  Dashboard                   │  │
+│  │  - Lista sessões             │  │
+│  │  - Status de cada sessão     │  │
+│  └──────────────────────────────┘  │
+└─────────────────────────────────────┘
+```
+
+**Vantagens:**
+- Múltiplas sessões isoladas
+- API com `session_id`
+- Dashboard de gerenciamento
+- Escalável
 
 ---
 
 ## 🏗️ Arquitetura Proposta
 
-### 1. Gerenciador de Sessões (Session Manager)
+### Nova Estrutura Multi-Session
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│              Session Manager (Singleton)                 │
-│  ┌──────────────────────────────────────────────────┐   │
-│  │  Map[sessionID] → *WhatsAppSession              │   │
-│  │  - Gerenciamento de ciclo de vida               │   │
-│  │  - Pool de conexões                             │   │
-│  │  - Health checks                                │   │
-│  └──────────────────────────────────────────────────┘   │
+│              GoWA Multi-Session                         │
+│                                                          │
+│  ┌──────────────────────────────────────────────────┐  │
+│  │         Session Manager (Singleton)              │  │
+│  │                                                   │  │
+│  │  type SessionManager struct {                    │  │
+│  │      sessions map[string]*Session                │  │
+│  │      mu       sync.RWMutex                       │  │
+│  │  }                                               │  │
+│  │                                                   │  │
+│  │  type Session struct {                           │  │
+│  │      ID            string                        │  │
+│  │      Client        *whatsmeow.Client             │  │
+│  │      DB            *sqlstore.Container           │  │
+│  │      ChatStorage   IChatStorageRepository        │  │
+│  │      Status        SessionStatus                 │  │
+│  │      CreatedAt     time.Time                     │  │
+│  │      LastActivity  time.Time                     │  │
+│  │  }                                               │  │
+│  └──────────────────────────────────────────────────┘  │
+│                                                          │
+│  ┌──────────────┐ ┌──────────────┐ ┌──────────────┐   │
+│  │   Session 1  │ │   Session 2  │ │   Session 3  │   │
+│  │              │ │              │ │              │   │
+│  │  Client      │ │  Client      │ │  Client      │   │
+│  │  DB (isolado)│ │  DB (isolado)│ │  DB (isolado)│   │
+│  │  ChatStorage │ │  ChatStorage │ │  ChatStorage │   │
+│  │  ~15MB RAM   │ │  ~15MB RAM   │ │  ~15MB RAM   │   │
+│  └──────────────┘ └──────────────┘ └──────────────┘   │
+│                                                          │
+│  ┌──────────────────────────────────────────────────┐  │
+│  │              Dashboard Web                       │  │
+│  │  - Lista todas sessões                           │  │
+│  │  - Status (connected/disconnected)               │  │
+│  │  - Criar/Deletar sessões                        │  │
+│  │  - QR Code por sessão                           │  │
+│  └──────────────────────────────────────────────────┘  │
+│                                                          │
+│  ┌──────────────────────────────────────────────────┐  │
+│  │              API Routes                          │  │
+│  │  GET  /api/sessions              - Lista sessões │  │
+│  │  POST /api/sessions              - Cria sessão   │  │
+│  │  GET  /api/sessions/:id          - Info sessão   │  │
+│  │  DEL  /api/sessions/:id          - Remove sessão │  │
+│  │  GET  /api/:session/login        - Login sessão  │  │
+│  │  POST /api/:session/send/message - Envia msg     │  │
+│  │  ... (todas rotas com :session)                  │  │
+│  └──────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────┘
-                          │
-        ┌─────────────────┼─────────────────┐
-        │                 │                 │
-   ┌────▼────┐      ┌────▼────┐      ┌────▼────┐
-   │Session 1│      │Session 2│      │Session N│
-   │ 15MB    │      │ 15MB    │      │ 15MB    │
-   └─────────┘      └─────────┘      └─────────┘
-```
-
-### 2. Estrutura de Dados
-
-```go
-// WhatsAppSession representa uma sessão WhatsApp isolada
-type WhatsAppSession struct {
-    ID            string                    // session_id único
-    Client        *whatsmeow.Client         // Cliente WhatsApp
-    DB            *sqlstore.Container       // Banco de dados da sessão
-    KeysDB        *sqlstore.Container       // Banco de chaves (opcional)
-    ChatStorage   domainChatStorage.IChatStorageRepository
-    Status        SessionStatus             // CONNECTED, DISCONNECTED, etc.
-    CreatedAt     time.Time
-    LastActivity  time.Time
-    Config        SessionConfig             // Configurações específicas
-    mu            sync.RWMutex              // Lock para thread-safety
-}
-
-// SessionManager gerencia todas as sessões
-type SessionManager struct {
-    sessions      map[string]*WhatsAppSession
-    defaultDBURI  string                    // URI base para novas sessões
-    mu            sync.RWMutex
-    cleanupTicker *time.Ticker              // Limpeza de sessões inativas
-}
 ```
 
 ---
 
-## 📁 Estrutura de Diretórios Proposta
+## 📁 Estrutura de Arquivos Proposta
 
 ```
 src/
 ├── cmd/
-│   └── root.go (modificado)
+│   ├── root.go              # Modificado: Inicializa SessionManager
+│   ├── rest.go              # Modificado: Adiciona rotas de sessão
+│   └── mcp.go               # Mantido
+│
 ├── domains/
-│   └── session/                    # NOVO - Domínio de sessões
-│       ├── session.go              # Entidades e interfaces
-│       └── interfaces.go
+│   ├── session/             # NOVO: Domínio de sessão
+│   │   ├── session.go       # Estruturas e interfaces
+│   │   └── interfaces.go    # ISessionManager, ISession
+│   └── ... (outros domínios)
+│
 ├── infrastructure/
+│   ├── session/             # NOVO: Implementação de sessões
+│   │   ├── manager.go       # SessionManager implementation
+│   │   ├── session.go       # Session implementation
+│   │   └── storage.go       # Gerenciamento de storage por sessão
 │   ├── whatsapp/
-│   │   ├── init.go (modificado)
-│   │   ├── session_manager.go      # NOVO - Gerenciador de sessões
-│   │   └── session.go              # NOVO - Estrutura de sessão
+│   │   ├── init.go          # Modificado: Remove global cli
+│   │   └── ... (outros)
 │   └── chatstorage/
-│       └── (sem mudanças)
+│       └── ... (mantido)
+│
 ├── ui/
 │   ├── rest/
-│   │   ├── app.go (modificado)
-│   │   ├── session.go              # NOVO - Endpoints de sessão
-│   │   └── dashboard.go            # NOVO - Dashboard endpoints
-│   └── dashboard/                  # NOVO - Frontend do dashboard
-│       ├── index.html
-│       ├── assets/
-│       └── components/
+│   │   ├── session.go       # NOVO: Handlers de sessão
+│   │   ├── app.go           # Modificado: Adiciona :session
+│   │   ├── send.go          # Modificado: Adiciona :session
+│   │   └── ... (todos modificados)
+│   ├── dashboard/           # NOVO: Dashboard web
+│   │   ├── dashboard.go     # Handler principal
+│   │   ├── views/
+│   │   │   └── dashboard.html
+│   │   └── assets/
+│   │       ├── dashboard.js
+│   │       └── dashboard.css
+│   └── websocket/
+│       └── websocket.go     # Modificado: Suporta múltiplas sessões
+│
 ├── usecase/
-│   └── session.go                  # NOVO - Casos de uso de sessão
-└── validations/
-    └── session_validation.go       # NOVO - Validações
+│   ├── session.go           # NOVO: Casos de uso de sessão
+│   └── ... (outros)
+│
+└── config/
+    └── settings.go          # Modificado: Configurações de sessão
 ```
 
 ---
 
-## 🔄 Fluxo de Implementação
+## 🔧 Implementação Detalhada
 
-### Fase 1: Core - Session Manager (Semana 1-2)
+### 1. Domínio de Sessão (`domains/session/`)
 
-#### 1.1 Criar estrutura base de sessão
-- [ ] Criar `domains/session/` com interfaces
-- [ ] Implementar `WhatsAppSession` struct
-- [ ] Implementar `SessionManager` singleton
-- [ ] Adicionar locks para thread-safety
-
-#### 1.2 Modificar inicialização
-- [ ] Modificar `InitWaCLI` para aceitar `sessionID`
-- [ ] Criar função `InitSession(sessionID string)`
-- [ ] Implementar isolamento de banco por sessão
-- [ ] Adicionar cleanup de sessões inativas
-
-**Arquivos a modificar:**
-- `src/infrastructure/whatsapp/init.go`
-- `src/infrastructure/whatsapp/session_manager.go` (NOVO)
-- `src/infrastructure/whatsapp/session.go` (NOVO)
-
-### Fase 2: API Multi-Sessão (Semana 2-3)
-
-#### 2.1 Modificar rotas REST
-- [ ] Adicionar middleware para extrair `session_id`
-- [ ] Modificar todas as rotas para aceitar `session_id`
-- [ ] Manter compatibilidade com API antiga (sem session_id = default)
-- [ ] Adicionar rotas de gerenciamento de sessão
-
-**Rotas propostas:**
-```
-# Gerenciamento de Sessões
-POST   /api/sessions                    # Criar nova sessão
-GET    /api/sessions                    # Listar todas as sessões
-GET    /api/sessions/:session_id        # Obter detalhes da sessão
-DELETE /api/sessions/:session_id        # Deletar sessão
-POST   /api/sessions/:session_id/start  # Iniciar sessão
-POST   /api/sessions/:session_id/stop   # Parar sessão
-
-# APIs com session_id (opcional para compatibilidade)
-GET    /api/:session_id/app/login
-GET    /api/:session_id/app/logout
-POST   /api/:session_id/send/message
-# ... todas as outras rotas
-```
-
-#### 2.2 Middleware de sessão
 ```go
-func SessionMiddleware(c *fiber.Ctx) error {
-    sessionID := c.Params("session_id")
-    if sessionID == "" {
-        sessionID = "default" // Compatibilidade
-    }
+// domains/session/session.go
+package session
+
+import (
+    "context"
+    "time"
+    "go.mau.fi/whatsmeow"
+    "go.mau.fi/whatsmeow/store/sqlstore"
+    domainChatStorage "github.com/.../domains/chatstorage"
+)
+
+type SessionStatus string
+
+const (
+    StatusDisconnected SessionStatus = "disconnected"
+    StatusConnecting   SessionStatus = "connecting"
+    StatusConnected    SessionStatus = "connected"
+    StatusLoggedIn     SessionStatus = "logged_in"
+    StatusError        SessionStatus = "error"
+)
+
+type Session struct {
+    ID            string
+    Name          string                    // Nome amigável (opcional)
+    Client        *whatsmeow.Client
+    DB            *sqlstore.Container
+    ChatStorage   domainChatStorage.IChatStorageRepository
+    Status        SessionStatus
+    DeviceID      string
+    CreatedAt     time.Time
+    LastActivity  time.Time
+    Error         error
+}
+
+type ISessionManager interface {
+    // Gerenciamento de sessões
+    CreateSession(ctx context.Context, sessionID string, name string) (*Session, error)
+    GetSession(sessionID string) (*Session, error)
+    GetAllSessions() map[string]*Session
+    DeleteSession(ctx context.Context, sessionID string) error
     
-    session := sessionManager.Get(sessionID)
-    if session == nil {
-        return c.Status(404).JSON(fiber.Map{
-            "error": "Session not found",
-        })
-    }
+    // Operações de sessão
+    StartSession(ctx context.Context, sessionID string) error
+    StopSession(ctx context.Context, sessionID string) error
+    RestartSession(ctx context.Context, sessionID string) error
     
-    c.Locals("session", session)
-    c.Locals("session_id", sessionID)
-    return c.Next()
+    // Status
+    GetSessionStatus(sessionID string) (SessionStatus, error)
+    GetSessionStats() SessionStats
+}
+
+type SessionStats struct {
+    Total       int
+    Connected   int
+    Disconnected int
+    Error       int
 }
 ```
 
-**Arquivos a modificar:**
-- `src/ui/rest/app.go`
-- `src/ui/rest/session.go` (NOVO)
-- `src/ui/rest/middleware/session.go` (NOVO)
-- Todos os handlers REST existentes
-
-### Fase 3: Dashboard (Semana 3-4)
-
-#### 3.1 Backend do Dashboard
-- [ ] Criar endpoints de estatísticas
-- [ ] Endpoint de métricas de sessões
-- [ ] WebSocket para atualizações em tempo real
-- [ ] API de logs por sessão
-
-**Endpoints:**
-```
-GET /api/dashboard/stats           # Estatísticas gerais
-GET /api/dashboard/sessions        # Lista de sessões com status
-GET /api/dashboard/metrics         # Métricas de performance
-WS  /api/dashboard/events          # Eventos em tempo real
-```
-
-#### 3.2 Frontend do Dashboard
-- [ ] Criar interface HTML/Vue.js
-- [ ] Lista de sessões com status
-- [ ] Gráficos de uso de memória
-- [ ] Gerenciamento de sessões (criar/deletar)
-- [ ] Logs em tempo real
-
-**Arquivos a criar:**
-- `src/ui/dashboard/index.html`
-- `src/ui/dashboard/assets/dashboard.js`
-- `src/ui/dashboard/assets/dashboard.css`
-- `src/ui/rest/dashboard.go` (NOVO)
-
-### Fase 4: Otimizações e Isolamento (Semana 4-5)
-
-#### 4.1 Isolamento de recursos
-- [ ] Banco de dados isolado por sessão
-- [ ] Chat storage isolado por sessão
-- [ ] Diretórios de mídia isolados
-- [ ] Configurações por sessão
-
-#### 4.2 Otimizações de memória
-- [ ] Lazy loading de sessões
-- [ ] Unload de sessões inativas
-- [ ] Pool de conexões compartilhado
-- [ ] Garbage collection otimizado
-
-#### 4.3 Health checks
-- [ ] Monitoramento de saúde das sessões
-- [ ] Auto-reconnect por sessão
-- [ ] Alertas de sessões com problemas
-- [ ] Métricas de performance
-
----
-
-## 💾 Estratégia de Armazenamento
-
-### Opção 1: Banco Único com Prefixo (Recomendado)
-```
-DB_URI=postgres://.../gowa
-- Tabela: sessions (id, session_id, device_id, ...)
-- Prefixo nas tabelas: session_<id>_messages, session_<id>_chats
-```
-
-**Vantagens:**
-- Fácil backup/restore
-- Queries cross-session possíveis
-- Menos overhead de conexões
-
-**Desvantagens:**
-- Schema mais complexo
-- Migrations mais complicadas
-
-### Opção 2: Banco por Sessão
-```
-DB_URI=postgres://.../gowa_session_{session_id}
-- Cada sessão tem seu próprio banco
-- Isolamento total
-```
-
-**Vantagens:**
-- Isolamento completo
-- Fácil deletar sessão (drop database)
-- Schema simples
-
-**Desvantagens:**
-- Muitas conexões de banco
-- Backup mais complexo
-- Overhead de conexões
-
-### Opção 3: Híbrido (Recomendado para produção)
-```
-- Banco principal: Metadados de sessões
-- Banco por sessão: Dados da sessão (SQLite ou PostgreSQL separado)
-- Chat storage: SQLite por sessão em disco
-```
-
----
-
-## 🔧 Implementação Técnica Detalhada
-
-### 1. Session Manager
+### 2. Session Manager (`infrastructure/session/manager.go`)
 
 ```go
-// src/infrastructure/whatsapp/session_manager.go
-
-package whatsapp
+// infrastructure/session/manager.go
+package session
 
 import (
+    "context"
+    "fmt"
     "sync"
     "time"
-    "context"
+    "go.mau.fi/whatsmeow/store/sqlstore"
+    domainSession "github.com/.../domains/session"
+    domainChatStorage "github.com/.../domains/chatstorage"
+    "github.com/.../infrastructure/chatstorage"
+    "github.com/.../infrastructure/whatsapp"
 )
 
 type SessionManager struct {
-    sessions      map[string]*WhatsAppSession
-    mu            sync.RWMutex
-    defaultDBURI  string
-    cleanupTicker *time.Ticker
+    sessions map[string]*domainSession.Session
+    mu       sync.RWMutex
+    basePath string // Caminho base para storages
 }
 
-var (
-    globalSessionManager *SessionManager
-    sessionManagerOnce   sync.Once
-)
-
-func GetSessionManager() *SessionManager {
-    sessionManagerOnce.Do(func() {
-        globalSessionManager = &SessionManager{
-            sessions:     make(map[string]*WhatsAppSession),
-            defaultDBURI: config.DBURI,
-        }
-        globalSessionManager.startCleanup()
-    })
-    return globalSessionManager
+func NewSessionManager(basePath string) domainSession.ISessionManager {
+    return &SessionManager{
+        sessions: make(map[string]*domainSession.Session),
+        basePath: basePath,
+    }
 }
 
-func (sm *SessionManager) CreateSession(sessionID string, config SessionConfig) (*WhatsAppSession, error) {
+func (sm *SessionManager) CreateSession(ctx context.Context, sessionID string, name string) (*domainSession.Session, error) {
     sm.mu.Lock()
     defer sm.mu.Unlock()
     
+    // Verifica se já existe
     if _, exists := sm.sessions[sessionID]; exists {
         return nil, fmt.Errorf("session %s already exists", sessionID)
     }
     
-    session := &WhatsAppSession{
-        ID:           sessionID,
-        Status:       StatusCreated,
-        CreatedAt:    time.Now(),
-        LastActivity: time.Now(),
-        Config:       config,
+    // Cria banco de dados isolado para a sessão
+    dbURI := fmt.Sprintf("file:%s/sessions/%s/whatsapp.db?_foreign_keys=on", sm.basePath, sessionID)
+    db := whatsapp.InitWaDB(ctx, dbURI)
+    
+    // Cria chat storage isolado
+    chatStorageURI := fmt.Sprintf("file:%s/sessions/%s/chatstorage.db", sm.basePath, sessionID)
+    chatStorageDB, err := initChatStorageForSession(chatStorageURI)
+    if err != nil {
+        return nil, fmt.Errorf("failed to init chat storage: %w", err)
+    }
+    chatStorageRepo := chatstorage.NewStorageRepository(chatStorageDB)
+    chatStorageRepo.InitializeSchema()
+    
+    // Cria cliente WhatsApp (ainda não conectado)
+    device, err := db.GetFirstDevice(ctx)
+    if err != nil {
+        // Se não existe device, cria um novo
+        device = &store.Device{}
     }
     
-    // Inicializar banco de dados isolado
-    dbURI := sm.getDBURIForSession(sessionID)
-    session.DB = InitWaDB(context.Background(), dbURI)
+    client := whatsapp.InitWaCLIForSession(ctx, db, nil, chatStorageRepo, device)
     
-    // Inicializar chat storage isolado
-    chatStorageDB := initChatStorageForSession(sessionID)
-    session.ChatStorage = chatstorage.NewStorageRepository(chatStorageDB)
+    session := &domainSession.Session{
+        ID:           sessionID,
+        Name:         name,
+        Client:       client,
+        DB:           db,
+        ChatStorage:  chatStorageRepo,
+        Status:       domainSession.StatusDisconnected,
+        CreatedAt:    time.Now(),
+        LastActivity: time.Now(),
+    }
     
     sm.sessions[sessionID] = session
     return session, nil
 }
 
-func (sm *SessionManager) GetSession(sessionID string) *WhatsAppSession {
+func (sm *SessionManager) GetSession(sessionID string) (*domainSession.Session, error) {
     sm.mu.RLock()
     defer sm.mu.RUnlock()
-    return sm.sessions[sessionID]
+    
+    session, exists := sm.sessions[sessionID]
+    if !exists {
+        return nil, fmt.Errorf("session %s not found", sessionID)
+    }
+    
+    return session, nil
 }
 
-func (sm *SessionManager) DeleteSession(sessionID string) error {
+func (sm *SessionManager) GetAllSessions() map[string]*domainSession.Session {
+    sm.mu.RLock()
+    defer sm.mu.RUnlock()
+    
+    // Retorna cópia para evitar race conditions
+    result := make(map[string]*domainSession.Session)
+    for k, v := range sm.sessions {
+        result[k] = v
+    }
+    return result
+}
+
+func (sm *SessionManager) DeleteSession(ctx context.Context, sessionID string) error {
     sm.mu.Lock()
     defer sm.mu.Unlock()
     
@@ -357,254 +366,285 @@ func (sm *SessionManager) DeleteSession(sessionID string) error {
         return fmt.Errorf("session %s not found", sessionID)
     }
     
-    // Cleanup
-    session.Cleanup()
+    // Desconecta cliente
+    if session.Client != nil {
+        session.Client.Disconnect()
+    }
+    
+    // Limpa recursos
+    // TODO: Limpar banco de dados e arquivos
+    
     delete(sm.sessions, sessionID)
     return nil
 }
-
-func (sm *SessionManager) ListSessions() []*WhatsAppSession {
-    sm.mu.RLock()
-    defer sm.mu.RUnlock()
-    
-    sessions := make([]*WhatsAppSession, 0, len(sm.sessions))
-    for _, session := range sm.sessions {
-        sessions = append(sessions, session)
-    }
-    return sessions
-}
 ```
 
-### 2. Modificação dos Handlers
+### 3. Modificação das Rotas REST
 
 ```go
-// src/ui/rest/send.go (exemplo)
-
-func (handler *Send) SendMessage(c *fiber.Ctx) error {
-    // Obter sessão do contexto (setado pelo middleware)
-    session := c.Locals("session").(*whatsapp.WhatsAppSession)
-    sessionID := c.Locals("session_id").(string)
+// ui/rest/app.go (modificado)
+func InitRestApp(app fiber.Router, sessionManager domainSession.ISessionManager) {
+    // Rotas de gerenciamento de sessões
+    sessionHandler := NewSessionHandler(sessionManager)
+    app.Get("/api/sessions", sessionHandler.ListSessions)
+    app.Post("/api/sessions", sessionHandler.CreateSession)
+    app.Get("/api/sessions/:id", sessionHandler.GetSession)
+    app.Delete("/api/sessions/:id", sessionHandler.DeleteSession)
     
-    // Usar cliente da sessão
-    client := session.GetClient()
-    if client == nil {
-        return c.Status(400).JSON(fiber.Map{
-            "error": "Session not connected",
-        })
-    }
+    // Rotas com :session (middleware para validar sessão)
+    sessionGroup := app.Group("/api/:session", sessionMiddleware(sessionManager))
     
-    // Resto da lógica usando client da sessão
-    // ...
+    // Rotas de app por sessão
+    appHandler := NewAppHandler(sessionManager)
+    sessionGroup.Get("/app/login", appHandler.Login)
+    sessionGroup.Get("/app/logout", appHandler.Logout)
+    sessionGroup.Get("/app/status", appHandler.Status)
+    
+    // Rotas de envio por sessão
+    sendHandler := NewSendHandler(sessionManager)
+    sessionGroup.Post("/send/message", sendHandler.SendMessage)
+    sessionGroup.Post("/send/image", sendHandler.SendImage)
+    // ... outras rotas
 }
-```
 
-### 3. Compatibilidade com API Antiga
-
-```go
-// Middleware que detecta se session_id está presente
-func SessionMiddleware(c *fiber.Ctx) error {
-    sessionID := c.Params("session_id")
-    
-    // Se não tem session_id, usar "default"
-    if sessionID == "" {
-        sessionID = "default"
-        
-        // Criar sessão default se não existir
-        sm := whatsapp.GetSessionManager()
-        if sm.GetSession("default") == nil {
-            sm.CreateSession("default", whatsapp.DefaultSessionConfig())
+// Middleware para validar e injetar sessão
+func sessionMiddleware(sm domainSession.ISessionManager) fiber.Handler {
+    return func(c *fiber.Ctx) error {
+        sessionID := c.Params("session")
+        if sessionID == "" {
+            return c.Status(400).JSON(fiber.Map{
+                "error": "session parameter is required",
+            })
         }
+        
+        session, err := sm.GetSession(sessionID)
+        if err != nil {
+            return c.Status(404).JSON(fiber.Map{
+                "error": fmt.Sprintf("session %s not found", sessionID),
+            })
+        }
+        
+        // Injeta sessão no contexto
+        c.Locals("session", session)
+        c.Locals("sessionID", sessionID)
+        
+        return c.Next()
+    }
+}
+```
+
+### 4. Dashboard Web
+
+```go
+// ui/dashboard/dashboard.go
+package dashboard
+
+import (
+    "github.com/gofiber/fiber/v2"
+    domainSession "github.com/.../domains/session"
+)
+
+type DashboardHandler struct {
+    sessionManager domainSession.ISessionManager
+}
+
+func InitDashboard(app fiber.Router, sessionManager domainSession.ISessionManager) {
+    handler := &DashboardHandler{sessionManager: sessionManager}
+    
+    // Dashboard principal
+    app.Get("/dashboard", handler.Index)
+    app.Get("/dashboard/api/sessions", handler.APISessions)
+    
+    // Assets estáticos
+    app.Static("/dashboard/assets", "./ui/dashboard/assets")
+}
+
+func (h *DashboardHandler) Index(c *fiber.Ctx) error {
+    return c.Render("dashboard/index", fiber.Map{
+        "Title": "GoWA Multi-Session Dashboard",
+    })
+}
+
+func (h *DashboardHandler) APISessions(c *fiber.Ctx) error {
+    sessions := h.sessionManager.GetAllSessions()
+    stats := h.sessionManager.GetSessionStats()
+    
+    return c.JSON(fiber.Map{
+        "sessions": sessions,
+        "stats": stats,
+    })
+}
+```
+
+### 5. Modificação do `cmd/root.go`
+
+```go
+// cmd/root.go (modificado)
+var (
+    sessionManager domainSession.ISessionManager
+    // Remove: whatsappCli, chatStorageDB, etc (agora por sessão)
+)
+
+func initApp() {
+    // Inicializa Session Manager
+    sessionManager = session.NewSessionManager(config.PathStorages)
+    
+    // Cria sessão padrão se não existir (para compatibilidade)
+    defaultSession, err := sessionManager.CreateSession(
+        context.Background(),
+        "default",
+        "Default Session",
+    )
+    if err != nil && !strings.Contains(err.Error(), "already exists") {
+        logrus.Fatalf("Failed to create default session: %v", err)
     }
     
-    session := whatsapp.GetSessionManager().GetSession(sessionID)
-    if session == nil {
-        return c.Status(404).JSON(fiber.Map{
-            "error": "Session not found",
-        })
+    // Inicializa sessão padrão se já existir
+    if defaultSession != nil {
+        // Auto-connect se já tiver device salvo
+        go func() {
+            if defaultSession.Client.Store.ID != nil {
+                defaultSession.Client.Connect()
+            }
+        }()
     }
-    
-    c.Locals("session", session)
-    c.Locals("session_id", sessionID)
-    return c.Next()
 }
 ```
 
 ---
 
-## 📊 Dashboard - Funcionalidades
+## 📊 Estratégia de Migração
 
-### Página Principal
-- **Lista de Sessões**
-  - Status (Connected/Disconnected/Error)
-  - Uso de memória por sessão
-  - Última atividade
-  - Ações (Start/Stop/Delete)
+### Fase 1: Preparação (Sem Breaking Changes)
+1. ✅ Criar domínio `session`
+2. ✅ Implementar `SessionManager`
+3. ✅ Manter compatibilidade com código atual
+4. ✅ Adicionar rotas `/api/sessions` (novas)
 
-- **Estatísticas Gerais**
-  - Total de sessões
-  - Sessões ativas
-  - Memória total usada
-  - Mensagens enviadas/recebidas (hoje)
+### Fase 2: Implementação Multi-Session
+1. ✅ Modificar rotas para aceitar `:session`
+2. ✅ Adicionar middleware de sessão
+3. ✅ Modificar todos os handlers para usar sessão do contexto
+4. ✅ Manter rotas antigas (deprecated) para compatibilidade
 
-- **Gráficos**
-  - Uso de memória ao longo do tempo
-  - Mensagens por hora
-  - Sessões ativas ao longo do tempo
+### Fase 3: Dashboard
+1. ✅ Criar interface de dashboard
+2. ✅ Integrar com SessionManager
+3. ✅ Adicionar funcionalidades de gerenciamento
 
-### Página de Sessão
-- **Detalhes da Sessão**
-  - Device ID
-  - Status de conexão
-  - Informações do usuário
-  - Configurações
-
-- **Logs em Tempo Real**
-  - Eventos da sessão
-  - Erros
-  - Mensagens
-
-- **Ações**
-  - Reconnect
-  - Logout
-  - Exportar dados
+### Fase 4: Otimização
+1. ✅ Lazy loading de sessões
+2. ✅ Cleanup automático de sessões inativas
+3. ✅ Monitoramento de memória
+4. ✅ Métricas e logging
 
 ---
 
-## 🧪 Testes
+## 🗄️ Estrutura de Armazenamento
 
-### Testes Unitários
-- [ ] Session Manager (criar/listar/deletar)
-- [ ] Isolamento de dados entre sessões
-- [ ] Cleanup de sessões inativas
-- [ ] Thread-safety do manager
-
-### Testes de Integração
-- [ ] Múltiplas sessões simultâneas
-- [ ] API com e sem session_id
-- [ ] Dashboard endpoints
-- [ ] WebSocket de eventos
-
-### Testes de Performance
-- [ ] Memória por sessão (target: ≤20MB)
-- [ ] Tempo de criação de sessão
-- [ ] Throughput com 50 sessões
-- [ ] Garbage collection
+```
+storages/
+├── sessions/
+│   ├── default/
+│   │   ├── whatsapp.db
+│   │   └── chatstorage.db
+│   ├── session1/
+│   │   ├── whatsapp.db
+│   │   └── chatstorage.db
+│   └── session2/
+│       ├── whatsapp.db
+│       └── chatstorage.db
+└── (arquivos temporários compartilhados)
+```
 
 ---
 
-## 📈 Métricas e Monitoramento
+## 🔐 Isolamento de Sessões
 
-### Métricas por Sessão
-- Memória usada
-- CPU usage
-- Mensagens enviadas/recebidas
-- Tempo de resposta da API
-- Status de conexão
+### Por Sessão:
+- ✅ Banco de dados WhatsApp isolado
+- ✅ Chat storage isolado
+- ✅ Cliente WhatsApp isolado
+- ✅ Event handlers isolados
+- ✅ Webhooks configuráveis por sessão
 
-### Métricas Globais
-- Total de sessões
-- Sessões ativas
-- Memória total
-- Requests por segundo
-- Erros por tipo
+### Compartilhado:
+- ✅ Configurações globais (porta, debug, etc)
+- ✅ Assets estáticos
+- ✅ Dashboard
 
 ---
 
-## 🚀 Plano de Migração
+## 📈 Estimativa de Consumo
 
-### Fase de Transição (2 semanas)
-1. **Semana 1**: Implementar Session Manager + API multi-sessão
-   - Manter API antiga funcionando
-   - Adicionar suporte opcional a session_id
-   - Testes com 2-3 sessões
+| Componente | Memória por Sessão |
+|------------|-------------------|
+| Cliente WhatsApp | ~10MB |
+| Database Connection | ~2MB |
+| Chat Storage | ~1MB |
+| Event Handlers | ~1MB |
+| Overhead | ~1MB |
+| **Total** | **~15MB** |
 
-2. **Semana 2**: Dashboard + Otimizações
-   - Implementar dashboard básico
-   - Otimizações de memória
-   - Testes com 10+ sessões
-
-### Compatibilidade
-- API antiga continua funcionando (usa sessão "default")
-- Novos clientes podem usar session_id
-- Migração gradual possível
+**Exemplo:**
+- 10 sessões = ~150MB
+- 50 sessões = ~750MB
+- 100 sessões = ~1.5GB
 
 ---
 
-## ⚠️ Riscos e Mitigações
+## 🚀 Próximos Passos
 
-### Risco 1: Aumento de memória
-**Mitigação:**
-- Lazy loading de sessões
-- Unload de sessões inativas
-- Pool de recursos compartilhados
+1. **Criar branch de desenvolvimento**
+   ```bash
+   git checkout -b feature/multi-session
+   ```
 
-### Risco 2: Complexidade de código
-**Mitigação:**
-- Refatoração gradual
-- Testes extensivos
-- Documentação detalhada
+2. **Implementar Fase 1** (Preparação)
+   - Criar `domains/session/`
+   - Implementar `SessionManager` básico
+   - Testes unitários
 
-### Risco 3: Performance com muitas sessões
-**Mitigação:**
-- Benchmarks regulares
-- Otimizações baseadas em métricas
-- Limite configurável de sessões
+3. **Implementar Fase 2** (Multi-Session)
+   - Modificar rotas REST
+   - Adicionar middleware
+   - Migrar handlers
 
----
+4. **Implementar Fase 3** (Dashboard)
+   - Interface web
+   - Integração com API
 
-## 📝 Checklist de Implementação
-
-### Core
-- [ ] Session Manager implementado
-- [ ] Estrutura WhatsAppSession criada
-- [ ] Isolamento de banco por sessão
-- [ ] Thread-safety garantido
-
-### API
-- [ ] Middleware de sessão
-- [ ] Todas as rotas modificadas
-- [ ] Compatibilidade com API antiga
-- [ ] Endpoints de gerenciamento
-
-### Dashboard
-- [ ] Backend de estatísticas
-- [ ] Frontend básico
-- [ ] WebSocket de eventos
-- [ ] Gráficos e métricas
-
-### Otimizações
-- [ ] Lazy loading
-- [ ] Cleanup automático
-- [ ] Pool de recursos
-- [ ] Health checks
-
-### Documentação
-- [ ] README atualizado
-- [ ] API documentation
-- [ ] Guia de migração
-- [ ] Exemplos de uso
+5. **Testes e Otimização**
+   - Testes de carga
+   - Monitoramento de memória
+   - Ajustes finos
 
 ---
 
-## 🎯 Próximos Passos
+## 📝 Notas Importantes
 
-1. **Revisar este plano** e ajustar conforme necessário
-2. **Criar branch** `feature/multi-session`
-3. **Implementar Fase 1** (Session Manager)
-4. **Testes iniciais** com 2-3 sessões
-5. **Iterar** baseado em feedback
-
----
-
-## 📚 Referências
-
-- [WAHA Architecture](https://github.com/devlikeapro/waha) - Referência de multi-sessão
-- [Whatsmeow Documentation](https://github.com/maurodaniel/go-whatsmeow) - Biblioteca base
-- [Go Memory Optimization](https://go.dev/doc/gc-guide) - Otimizações de memória
+1. **Compatibilidade**: Manter rotas antigas funcionando (deprecated)
+2. **Migração**: Script para migrar sessão única para multi-session
+3. **Documentação**: Atualizar README com novo formato de API
+4. **Breaking Changes**: Versão 8.0.0 (major version)
 
 ---
 
-**Versão:** 1.0  
-**Data:** 2025-01-29  
-**Autor:** CloudBlackhand
+## 🎯 Resultado Esperado
+
+Ao final da implementação, teremos:
+
+✅ **GoWA Multi-Session** com:
+- Suporte nativo a N sessões simultâneas
+- Dashboard web para gerenciamento
+- API RESTful com `session_id`
+- Baixo consumo de memória (~15MB/sessão)
+- Isolamento completo entre sessões
+- Compatibilidade com código existente (via sessão "default")
+
+---
+
+**Data de Criação**: 2025-01-29  
+**Versão do Plano**: 1.0  
+**Status**: Pronto para implementação
 
